@@ -1,0 +1,22 @@
+# シェルスクリプトとDocker関連は LF 固定（Linux で動かすため）
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.conf      text eol=lf
+
+# Python / TypeScript / その他テキストは Git に任せる
+*.py        text
+*.ts        text
+*.tsx       text
+*.js        text
+*.jsx       text
+*.json      text
+*.md        text
+
+# バイナリは text 扱いしない
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary

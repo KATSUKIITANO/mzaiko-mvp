@@ -1,0 +1,109 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: mzaiko-api
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/docs',timeout=3).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks: [mzaiko_net]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: mzaiko-frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+    depends_on:
+      - api
+    networks: [mzaiko_net]
+
+  db:
+    image: postgres:16-alpine
+    container_name: mzaiko-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [mzaiko_net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: mzaiko-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [mzaiko_net]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: mzaiko-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/templates/nginx.conf.template:ro
+      - certbot_etc:/etc/letsencrypt:ro
+      - certbot_var:/var/www/certbot:ro
+      - nginx_logs:/var/log/nginx
+    command: >
+      /bin/sh -c "envsubst '$$DOMAIN' < /etc/nginx/templates/nginx.conf.template
+      > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    depends_on:
+      - api
+      - frontend
+    networks: [mzaiko_net]
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: mzaiko-certbot
+    restart: unless-stopped
+    volumes:
+      - certbot_etc:/etc/letsencrypt
+      - certbot_var:/var/www/certbot
+    entrypoint: /bin/sh -c "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done"
+
+networks:
+  mzaiko_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  certbot_etc:
+  certbot_var:
+  nginx_logs:
