@@ -351,7 +351,42 @@ async def approve_task(
     await session.refresh(task)
     logger.info("task approved id=%d order_id=%d assigned_to=%s",
                 task.id, task.order_id, assigned_to)
+
+    await _place_cj_order_on_approve(task, session)
     return task
+
+
+async def _place_cj_order_on_approve(
+    task: FulfillmentTask,
+    session: AsyncSession,
+) -> None:
+    """approve された注文を CJ に発注する（CJ_ORDER_ON_APPROVE=true のとき）。
+
+    循環 import を避けるため関数内 import。発注失敗は approve を巻き戻さない。
+    """
+    if not settings.cj_order_on_approve:
+        return
+
+    from app.services.cj_order_service import place_cj_order_if_enabled
+
+    order = await session.get(Order, task.order_id)
+    if order is None:
+        logger.warning("cj order skipped: order not found task_id=%d", task.id)
+        return
+
+    result = await place_cj_order_if_enabled(session, order, trigger="approve")
+    if result is None:
+        return
+
+    _append_note(
+        task,
+        f"cj_order status={result.get('status')} "
+        f"cj_order_id={result.get('cj_order_id') or '-'} "
+        f"dry_run={result.get('dry_run')}"
+        + (f" error={result.get('error')}" if result.get("error") else ""),
+        label="cj-order",
+    )
+    await session.commit()
 
 
 async def mark_purchased(

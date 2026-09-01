@@ -17,6 +17,14 @@ from app.db.models import (
 )
 from app.schemas.analyze import AnalyzeRequest, AnalyzeResponse
 from app.schemas.bulk import BulkAnalyzeRequest, BulkAnalyzeResponse
+from app.schemas.cj import (
+    CJMappingItem,
+    CJMappingUpsertRequest,
+    CJOrderItem,
+    CJOrderPlaceRequest,
+    CJOrderPlaceResponse,
+    CJOrderWorkerMetrics,
+)
 from app.schemas.dashboard import DashboardSummary
 from app.schemas.ebay import EbaySearchRequest, EbaySearchResponse
 from app.schemas.export import ExportFilters
@@ -86,6 +94,15 @@ from app.scraper.cj import (
 )
 from app.services.analyze_service import AnalyzeError, analyze_product
 from app.services.auth_service import verify_api_key
+from app.services.cj_mapping_service import list_mappings, upsert_mapping
+from app.services.cj_order_service import (
+    CJOrderError,
+    get_cj_order_for_ebay_order,
+    get_last_metrics as get_cj_order_metrics,
+    list_cj_orders,
+    place_cj_order_for_ebay_order,
+    run_cj_order_worker,
+)
 from app.services.bulk_analyze_service import bulk_analyze_products
 from app.services.country_risk_service import (
     LEVEL_TO_SCORE,
@@ -918,6 +935,137 @@ async def cj_product_images_endpoint(pid: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
     return {"pid": pid, "image_urls": extract_image_urls(data)}
+
+
+# ─────────────────────────────────────
+# CJ 発注（eBay で売れた → CJ に反映）
+# ─────────────────────────────────────
+@private_router.post(
+    "/cj/orders/{ebay_order_id}/place",
+    response_model=CJOrderPlaceResponse,
+    tags=["cj"],
+    summary="eBay 注文を CJ に発注（冪等 / dry_run 対応）",
+)
+async def cj_order_place_endpoint(
+    ebay_order_id: str,
+    payload: CJOrderPlaceRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> CJOrderPlaceResponse:
+    body = payload or CJOrderPlaceRequest()
+    try:
+        result = await place_cj_order_for_ebay_order(
+            session, ebay_order_id, dry_run=body.dry_run, force=body.force,
+        )
+    except CJOrderError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except CJError as e:
+        raise HTTPException(status_code=502, detail=f"CJ API error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
+    return CJOrderPlaceResponse(**result)
+
+
+@private_router.get(
+    "/cj/orders",
+    response_model=list[CJOrderItem],
+    tags=["cj"],
+    summary="CJ 発注一覧（status で絞り込み）",
+)
+async def cj_orders_list_endpoint(
+    status_filter: str | None = Query(
+        None,
+        alias="status",
+        description="pending/dry_run/created/shipped/delivered/canceled/unmapped/failed",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> list[CJOrderItem]:
+    rows = await list_cj_orders(
+        session, status=status_filter, limit=limit, offset=offset
+    )
+    return [CJOrderItem.model_validate(r) for r in rows]
+
+
+@private_router.get(
+    "/cj/orders/{ebay_order_id}",
+    response_model=CJOrderItem,
+    tags=["cj"],
+    summary="eBay 注文に紐づく CJ 発注の状態",
+)
+async def cj_order_detail_endpoint(
+    ebay_order_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> CJOrderItem:
+    try:
+        cj_order = await get_cj_order_for_ebay_order(session, ebay_order_id)
+    except CJOrderError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return CJOrderItem.model_validate(cj_order)
+
+
+@private_router.post(
+    "/cj/orders/sync",
+    response_model=CJOrderWorkerMetrics,
+    tags=["cj"],
+    summary="CJ 発注ワーカーを手動実行（未発注の発注＋状態同期＋tracking反映）",
+)
+async def cj_orders_sync_endpoint() -> CJOrderWorkerMetrics:
+    metrics = await run_cj_order_worker()
+    return CJOrderWorkerMetrics(**metrics.as_dict())
+
+
+@private_router.get(
+    "/cj/orders/worker/metrics",
+    response_model=CJOrderWorkerMetrics,
+    tags=["cj"],
+    summary="CJ 発注ワーカーの直近実行メトリクス",
+)
+async def cj_orders_metrics_endpoint() -> CJOrderWorkerMetrics:
+    metrics = get_cj_order_metrics()
+    if metrics is None:
+        return CJOrderWorkerMetrics()
+    return CJOrderWorkerMetrics(**metrics.as_dict())
+
+
+@private_router.post(
+    "/cj/mappings",
+    response_model=CJMappingItem,
+    tags=["cj"],
+    summary="SKU ↔ CJ 商品の紐付けを登録・更新",
+)
+async def cj_mapping_upsert_endpoint(
+    payload: CJMappingUpsertRequest,
+    session: AsyncSession = Depends(get_session),
+) -> CJMappingItem:
+    try:
+        mapping = await upsert_mapping(
+            session,
+            sku=payload.sku,
+            cj_product_id=payload.cj_product_id,
+            product_id=payload.product_id,
+            cj_variant_id=payload.cj_variant_id,
+            cj_sku=payload.cj_sku,
+            note=payload.note,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"mapping 登録失敗: {e}")
+    return CJMappingItem.model_validate(mapping)
+
+
+@private_router.get(
+    "/cj/mappings",
+    response_model=list[CJMappingItem],
+    tags=["cj"],
+    summary="SKU ↔ CJ 商品の紐付け一覧",
+)
+async def cj_mappings_list_endpoint(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> list[CJMappingItem]:
+    rows = await list_mappings(session, limit=limit, offset=offset)
+    return [CJMappingItem.model_validate(r) for r in rows]
 
 
 @private_router.post(

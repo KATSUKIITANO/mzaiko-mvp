@@ -107,6 +107,19 @@ class CountryRiskLevel(str, enum.Enum):
     BLOCKED = "blocked"
 
 
+class CJOrderStatus(str, enum.Enum):
+    """eBay 受注 → CJ 発注の進行状態（ローカル管理）。"""
+
+    PENDING = "pending"        # 発注待ち（キュー投入済み）
+    DRY_RUN = "dry_run"        # payload のみ生成、CJ API 未呼び出し
+    CREATED = "created"        # CJ に注文作成済み
+    SHIPPED = "shipped"        # CJ 出荷済み（tracking 取得済み）
+    DELIVERED = "delivered"    # CJ 側で配達完了
+    CANCELED = "canceled"      # CJ 側でキャンセル
+    UNMAPPED = "unmapped"      # SKU → CJ 商品の紐付けが無く発注不可
+    FAILED = "failed"          # 発注失敗（リトライ対象）
+
+
 class Product(Base):
     __tablename__ = "products"
 
@@ -462,6 +475,101 @@ class FulfillmentTask(Base):
     )
     assigned_to: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class CJProductMapping(Base):
+    """eBay SKU ↔ CJ Dropshipping 商品（pid / vid）の紐付け。
+
+    売れた SKU から発注先の CJ 商品を特定するために使う。
+    出品時（CJ画像連携出品 / publish）に自動登録され、
+    /cj/mappings で手動 upsert もできる。
+    """
+
+    __tablename__ = "cj_product_mappings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sku: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+    product_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    cj_product_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    cj_variant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cj_sku: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class CJOrder(Base):
+    """eBay 注文 1件に対する CJ 発注（1 order = 1 CJ order）。"""
+
+    __tablename__ = "cj_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    ebay_order_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    sku: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    cj_order_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    cj_order_num: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cj_status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=CJOrderStatus.PENDING.value,
+        index=True,
+    )
+
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    shipping_country: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    logistic_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tracking_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    total_amount: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_payload: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    response_payload: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    placed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -127,23 +127,31 @@ async def apply_tracking_to_order(
     }
 
 
-# ── CJ tracking integration placeholder ─
+# ── CJ tracking integration ──────────
 async def sync_cj_tracking_for_order(
     session: AsyncSession, order_id: int
 ) -> dict[str, Any]:
-    """CJ から tracking を取得して反映する placeholder。
+    """CJ 注文の状態を引き直し、出荷済みなら tracking を eBay に反映する。
 
-    将来 CJ Dropshipping の Order Tracking API を呼んで
-    tracking_number / carrier を取得し、apply_tracking_to_order に渡す。
+    実体は cj_order_service.sync_cj_order()（循環 import を避けて関数内 import）。
     """
     order = await session.get(Order, order_id)
     if order is None:
         raise ListingError(f"order not found id={order_id}")
-    logger.info(
-        "cj tracking sync placeholder ebay_order_id=%s", order.ebay_order_id
+
+    from app.services.cj_order_service import (
+        CJOrderError,
+        get_cj_order_for_ebay_order,
+        sync_cj_order,
     )
-    return {
-        "success": False,
-        "skipped": True,
-        "reason": "cj tracking integration not yet implemented",
-    }
+
+    try:
+        cj_order = await get_cj_order_for_ebay_order(session, order.ebay_order_id)
+    except CJOrderError as e:
+        logger.info(
+            "cj tracking sync skipped ebay_order_id=%s reason=%s",
+            order.ebay_order_id, e,
+        )
+        return {"success": False, "skipped": True, "reason": str(e)}
+
+    return await sync_cj_order(session, cj_order)

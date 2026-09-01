@@ -26,6 +26,7 @@ from app.services.ebay_inventory_service import (
     safe_delete_inventory_item,
     upsert_inventory_item,
 )
+from app.services.cj_mapping_service import record_listing_mapping
 from app.services.ebay_listing_cj_service import _fetch_cj_image_urls
 from app.services.ebay_listing_service import ListingError
 from app.services.ebay_offer_service import (
@@ -99,6 +100,10 @@ async def publish_listing(
     preview = build_preview(product=product, image_urls=raw_urls)
 
     sku = preview["sku"]
+    # 売れたときに CJ へ発注できるよう SKU ↔ CJ 商品を記録しておく
+    await record_listing_mapping(
+        session, sku=sku, cj_product_id=cj_product_id, product_id=product_id
+    )
     inventory_payload = preview["inventory_payload"]
     offer_payload = preview["offer_payload"]
     publish_payload = preview["publish_payload"]

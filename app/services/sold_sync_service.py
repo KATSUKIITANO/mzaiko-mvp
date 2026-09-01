@@ -13,10 +13,10 @@ fulfillment_task を自動生成する。
   - 重複: ebay_order_id UNIQUE + 事前チェック
   - listing 紐付け: SKU で listings を検索、見つかれば listing_id を保存・SOLD 化
   - sold hook: fulfillment_service.create_task_from_order() で task 自動生成
+  - CJ 反映: CJ_AUTO_ORDER_ON_SOLD=true なら cj_order_service で即発注
+            （既定 OFF。通常は fulfillment task の approve 時に発注）
 
 future:
-  - Amazon 自動発注 → fulfillment task の approve hook に挿入
-  - 追跡番号同期 → task.shipped 時に eBay へ POST shipping_fulfillment
   - auto fulfill → fulfillment task の状態を全自動で進める
 """
 from __future__ import annotations
@@ -39,7 +39,8 @@ from tenacity import (
 
 from app.config import settings
 from app.db.database import AsyncSessionLocal
-from app.db.models import Listing, ListingStatus, Order, OrderStatus
+from app.db.models import Listing, ListingStatus, Order, OrderStatus, TaskStatus
+from app.services.cj_order_service import place_cj_order_if_enabled
 from app.services.ebay_auth_service import get_access_token
 from app.services.fulfillment_service import create_task_from_order
 
@@ -356,14 +357,27 @@ async def _trigger_post_sold_actions(
 ) -> None:
     """売れた直後の自動化 hook。
 
-    現在: fulfillment_task を作成して人間 review を待つキューに入れる。
+    1. fulfillment_task を作成して人間 review を待つキューに入れる
+    2. CJ_AUTO_ORDER_ON_SOLD=true なら、その場で CJ に発注（既定 OFF）
+       - task が failed（blocked 国 / 利益割れ）の場合は発注しない
+       - 既定は task approve 時に発注（cj_order_service 側の hook）
 
     将来:
-      - approve 後に Playwright 自動購入
-      - 追跡番号取得・eBay 同期
       - auto fulfill（人間介在なし）
     """
-    await create_task_from_order(order, listing, session)
+    task = await create_task_from_order(order, listing, session)
+
+    if not settings.cj_auto_order_on_sold:
+        return
+
+    if task.task_status in (TaskStatus.FAILED.value, TaskStatus.CANCELED.value):
+        logger.info(
+            "cj auto order skipped: task_status=%s order_id=%s",
+            task.task_status, order.ebay_order_id,
+        )
+        return
+
+    await place_cj_order_if_enabled(session, order, trigger="sold")
 
 
 async def _find_listing_by_sku(session: AsyncSession, sku: str) -> Listing | None:

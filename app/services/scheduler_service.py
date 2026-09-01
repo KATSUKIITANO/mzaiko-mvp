@@ -14,6 +14,7 @@ from app.db.models import MonitoringStatus, Product
 from app.schemas.ebay import EbaySearchRequest
 from app.scraper.amazon import scrape_amazon
 from app.services.ebay import search_ebay
+from app.services.cj_order_service import run_cj_order_worker
 from app.services.ebay_message_service import sync_messages
 from app.services.ebay_order_service import sync_orders
 from app.services.repricing_service import bulk_reprice
@@ -100,6 +101,30 @@ async def start_scheduler() -> None:
         )
     else:
         logger.info("scheduler: sold_sync_worker disabled")
+
+    # ── CJ 発注ワーカー（未発注の CJ 発注 + 状態同期 + tracking 反映）
+    if settings.cj_order_enabled and settings.cj_order_sync_enabled:
+        scheduler.add_job(
+            run_cj_order_worker,
+            trigger=IntervalTrigger(
+                minutes=settings.cj_order_sync_interval_minutes
+            ),
+            id="cj_order_worker",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        logger.info(
+            "scheduler: cj_order_worker registered interval=%dmin "
+            "batch_limit=%d dry_run=%s auto_on_sold=%s on_approve=%s",
+            settings.cj_order_sync_interval_minutes,
+            settings.cj_order_sync_batch_limit,
+            settings.cj_order_dry_run,
+            settings.cj_auto_order_on_sold,
+            settings.cj_order_on_approve,
+        )
+    else:
+        logger.info("scheduler: cj_order_worker disabled")
 
     # ── eBay buyer message sync
     if settings.ebay_message_sync_enabled:

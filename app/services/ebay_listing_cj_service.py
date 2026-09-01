@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.models import Product
 from app.scraper.cj import CJError, cj_product_detail, extract_image_urls
+from app.services.cj_mapping_service import record_listing_mapping
 from app.services.ebay_auth_service import get_access_token
 from app.services.ebay_listing_service import (
     QUANTITY_DEFAULT,
@@ -127,6 +128,11 @@ async def create_listing_with_cj_images(
     logger.info(
         "image attached count=%d sku=%s cj_pid=%s",
         len(image_urls), sku, cj_product_id,
+    )
+
+    # 売れたときに CJ へ発注できるよう SKU ↔ CJ 商品を記録しておく
+    await record_listing_mapping(
+        session, sku=sku, cj_product_id=cj_product_id, product_id=product_id
     )
 
     inventory_payload = _build_inventory_payload(

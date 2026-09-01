@@ -167,6 +167,24 @@ class Settings(BaseSettings):
     cj_request_timeout: float = 30.0
     cj_default_page_size: int = 20
 
+    # CJ 自動発注（eBay で売れた → CJ に反映）
+    cj_order_enabled: bool = True
+    cj_order_dry_run: bool = True          # 既定は payload 生成のみ（安全側）
+    cj_auto_order_on_sold: bool = False    # 売れた瞬間に無条件発注（既定OFF）
+    cj_order_on_approve: bool = True       # fulfillment task approve 時に発注
+    cj_order_from_country_code: str = "CN"
+    cj_order_logistic_name: str = ""       # 空なら CJ 側の既定配送を使う
+    cj_order_pay_type: int = 2             # 2 = 残高払い（CJ 既定）
+    cj_order_remark: str = ""
+    cj_order_max_attempts: int = 3
+
+    # CJ 注文ステータス同期（CJ 出荷 → eBay へ tracking 反映）
+    cj_order_sync_enabled: bool = True
+    cj_order_sync_interval_minutes: int = 30
+    cj_order_sync_batch_limit: int = 50
+    cj_order_push_tracking_to_ebay: bool = True
+    cj_default_carrier_code: str = "Other"
+
     # Rate Limit
     rate_limit_enabled: bool = True
     rate_limit_analyze_per_minute: int = 20

@@ -1,6 +1,6 @@
 # 無在庫販売 MVP
 
-eBay 出品 + revise + sold sync + fulfillment queue + 配送見積 + **国別リスクスコアリング** を備えた MVP。
+eBay 出品 + revise + sold sync + fulfillment queue + 配送見積 + 国別リスクスコアリング + **CJ自動発注（売れたらCJに反映）** を備えた MVP。
 
 ## 機能一覧（追加分）
 
@@ -17,6 +17,13 @@ eBay 出品 + revise + sold sync + fulfillment queue + 配送見積 + **国別�
 | `POST /ebay/listing/publish` | X-API-Key | 本番出品（preview→inventory→offer→publish, dry_run対応） |
 | `POST /ebay/listing/{sku}/withdraw` | X-API-Key | 手動でeBay listingを停止（offer withdraw） |
 | `POST /ebay/orders/sync` | X-API-Key | eBay Fulfillment APIから注文を incremental 同期 |
+| `POST /cj/orders/{ebay_order_id}/place` | X-API-Key | eBayで売れた注文をCJに発注（冪等 / dry_run対応） |
+| `GET /cj/orders` | X-API-Key | CJ発注の一覧（status で絞り込み） |
+| `GET /cj/orders/{ebay_order_id}` | X-API-Key | eBay注文に紐づくCJ発注の状態 |
+| `POST /cj/orders/sync` | X-API-Key | CJ発注ワーカー手動実行（発注＋状態同期＋tracking反映） |
+| `GET /cj/orders/worker/metrics` | X-API-Key | CJ発注ワーカーの直近メトリクス |
+| `POST /cj/mappings` | X-API-Key | SKU ↔ CJ商品(pid/vid) の紐付けを登録・更新 |
+| `GET /cj/mappings` | X-API-Key | SKU ↔ CJ商品の紐付け一覧 |
 
 ## CJ → eBay 画像統合フロー
 
@@ -609,9 +616,101 @@ curl -X POST "http://localhost:8000/ebay/orders/sync" \
 {"imported": 5, "updated": 2, "skipped": 10}
 ```
 
-### 将来の CJ 自動発注フック
+## CJ 自動発注（eBayで売れた → CJに反映）
 
-`Order` の `payment_status='PAID'` かつ `fulfillment_status='NOT_STARTED'` を SELECT して、`OrderItem.sku` から元商品 → CJ Product を引き、CJ API で発注を作る、という流れに接続できる。`raw_payload` に shipping address フル情報が残っているので、配送先抽出はそこから可能。
+eBay で売れた注文を CJ Dropshipping に発注し、CJ が出荷したら追跡番号を eBay に書き戻すまでを閉じたループにする。
+
+### フロー
+
+```
+sold sync (5分毎)
+  └─ eBay getOrders → Order 作成 → listing を sold 化 → fulfillment task 作成
+       ├─ CJ_AUTO_ORDER_ON_SOLD=true → その場で CJ 発注
+       └─ 既定: 人間が task を approve → CJ 発注（CJ_ORDER_ON_APPROVE=true）
+
+place_cj_order()
+  SKU → cj_product_mappings で CJ 商品(pid) を解決
+    └─ vid 未登録なら CJ /product/variant/query から取得して保存
+  配送先を fulfillment task（正規化済み）または Order.raw_payload から取得
+  → CJ /shopping/order/createOrderV2
+  → cj_orders に cj_order_id / payload / status を記録、Order.order_status='ordered'
+
+cj order worker (30分毎)
+  ├─ 未発注（pending/dry_run/unmapped/failed）を発注リトライ
+  └─ 発注済み（created/shipped）を CJ /shopping/order/getOrderDetail でポーリング
+       └─ 出荷検知 → tracking を eBay shipping_fulfillment へ POST
+          → Order.tracking_number / shipped_at / order_status='shipped'
+```
+
+支払いは行わない。CJ 側に未払い注文として作られるので、最終決済は人間が CJ 管理画面で確認できる。
+
+### 発注トリガと安全弁
+
+| env | 既定 | 意味 |
+|-----|------|------|
+| `CJ_ORDER_ENABLED` | true | 機能全体のスイッチ |
+| `CJ_ORDER_DRY_RUN` | **true** | payload を組み立てて保存するだけで CJ API を呼ばない |
+| `CJ_AUTO_ORDER_ON_SOLD` | false | 売れた瞬間に発注（人間 review をスキップ） |
+| `CJ_ORDER_ON_APPROVE` | true | fulfillment task の approve 時に発注 |
+| `CJ_ORDER_MAX_ATTEMPTS` | 3 | 失敗時のリトライ上限（`force=true` で無視） |
+| `CJ_ORDER_PUSH_TRACKING_TO_EBAY` | true | CJ 出荷時に eBay へ tracking を反映 |
+
+既存の risk / profit gate はそのまま効く。`fulfillment task` が `failed`（blocked 国・利益割れ）や `canceled` の注文は自動発注しない。
+
+### SKU ↔ CJ 商品のマッピング
+
+売れた SKU から発注先を特定するため `cj_product_mappings` を持つ。
+
+- CJ 画像連携で出品（`/ebay/listing/create`, `/ebay/listing/publish`）すると自動登録される
+- 既存出品は `POST /cj/mappings` で後追い登録できる
+- `vid`（CJ の発注単位）は未登録でも、初回発注時に CJ API から取得して保存する
+- マッピングが無い注文は発注されず `status='unmapped'` として残る（eBay 側の処理は止めない）
+
+```bash
+curl -X POST "http://localhost:8000/cj/mappings" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"sku": "mzaiko-1", "cj_product_id": "123456"}'
+```
+
+### 手動発注・状態確認
+
+```bash
+# dry_run で payload だけ確認（CJ を呼ばない）
+curl -X POST "http://localhost:8000/cj/orders/EB-ORDER-ID/place" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"dry_run": true}'
+
+# 本発注（冪等：既に CJ 注文があれば skipped で返る）
+curl -X POST "http://localhost:8000/cj/orders/EB-ORDER-ID/place" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{}'
+
+# 発注状態の一覧・詳細
+curl "http://localhost:8000/cj/orders?status=failed" -H "X-API-Key: $KEY"
+curl "http://localhost:8000/cj/orders/EB-ORDER-ID" -H "X-API-Key: $KEY"
+
+# ワーカーを手動実行（未発注の発注 + 状態同期 + tracking 反映）
+curl -X POST "http://localhost:8000/cj/orders/sync" -H "X-API-Key: $KEY"
+curl "http://localhost:8000/cj/orders/worker/metrics" -H "X-API-Key: $KEY"
+```
+
+### cj_orders（新規テーブル）
+
+| 列 | 内容 |
+|----|------|
+| `order_id` | `orders.id`（UNIQUE：1注文 = 1 CJ発注） |
+| `cj_order_id` / `cj_order_num` | CJ 側の注文ID |
+| `status` | pending / dry_run / created / shipped / delivered / canceled / unmapped / failed |
+| `cj_status` | CJ が返す生のステータス文字列 |
+| `tracking_number` | CJ から取得した追跡番号 |
+| `request_payload` / `response_payload` | createOrderV2 の送受信内容（監査・再現用） |
+| `attempts` / `error_message` | 失敗理由とリトライ回数 |
+
+### 冪等性・失敗時の扱い
+
+- 同じ eBay 注文に対して CJ 注文は 1つだけ（`cj_order_id` があれば再発注せず skip）
+- 住所不備・未マッピング・CJ API エラーは `cj_orders` に理由を残すだけで、sold sync や approve は失敗させない
+- 失敗行は次のワーカー実行で `CJ_ORDER_MAX_ATTEMPTS` まで自動リトライ
+- 追跡番号は同一値なら eBay へ再アップロードしない
 
 ## Production Deploy（VPS）
 
