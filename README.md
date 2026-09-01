@@ -16,6 +16,8 @@ eBay 出品 + revise + sold sync + fulfillment queue + 配送見積 + 国別リ�
 | `POST /ebay/listing/copy` | X-API-Key | eBay販売文章をAI生成（dry_run / templateフォールバック対応） |
 | `POST /ebay/listing/publish` | X-API-Key | 本番出品（preview→inventory→offer→publish, dry_run対応） |
 | `POST /ebay/listing/{sku}/withdraw` | X-API-Key | 手動でeBay listingを停止（offer withdraw） |
+| `POST /ebay/listing/{ref}/primary-image` | X-API-Key | トップ画像を現在のn枚目に差し替え（1始まり / dry_run対応） |
+| `POST /ebay/listings/primary-image/bulk` | X-API-Key | 複数listingのトップ画像をまとめて差し替え |
 | `POST /ebay/orders/sync` | X-API-Key | eBay Fulfillment APIから注文を incremental 同期 |
 | `POST /cj/orders/{ebay_order_id}/place` | X-API-Key | eBayで売れた注文をCJに発注（冪等 / dry_run対応） |
 | `GET /cj/orders` | X-API-Key | CJ発注の一覧（status で絞り込み） |
@@ -615,6 +617,75 @@ curl -X POST "http://localhost:8000/ebay/orders/sync" \
 ```json
 {"imported": 5, "updated": 2, "skipped": 10}
 ```
+
+## eBay トップ画像の差し替え
+
+eBay のギャラリー画像（トップ画像）は inventory item の `product.imageUrls` の**先頭**が使われる。
+「n枚目をトップにする」＝ imageUrls の n 番目を先頭に移動して PUT し直す、という操作になる。
+
+### 位置の数え方
+
+現在 **eBay に出ている並び**に対する 1 始まりの位置。`position=2` なら「いま2枚目に表示されている写真をトップにする」。
+出品時の CJ 画像リストではなく、実際の inventory item を GET した並びを基準にするので、運用者が管理画面で見ている番号とズレない。
+他の画像の相対順序は保たれる（`[1,2,3,4]` で position=2 → `[2,1,3,4]`）。
+
+### 反映されないときは
+
+PUT だけでは live listing への反映が遅れることがあるため、**既定で offer を再 publish する**（`republish=true`）。
+published でない listing、または offer_id が見つからない場合は再 publish をスキップし、inventory item の更新のみ行う。
+再 publish に失敗しても画像の更新自体は成功として扱う（ログに WARNING を残す）。
+なお eBay/CDN 側のキャッシュにより、検索結果のサムネイル反映には数分〜数十分かかることがある。
+
+### 使い方
+
+```bash
+# まず dry_run で「何が何に変わるか」を確認（eBay を呼ばない）
+curl -X POST "http://localhost:8000/ebay/listings/primary-image/bulk" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"dry_run": true, "items": [
+        {"ref": "5222", "position": 2},
+        {"ref": "5248", "position": 5},
+        {"ref": "5259", "position": 2},
+        {"ref": "5297", "position": 2}]}'
+
+# 問題なければ dry_run を外して本適用
+curl -X POST "http://localhost:8000/ebay/listings/primary-image/bulk" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"items": [
+        {"ref": "5222", "position": 2},
+        {"ref": "5248", "position": 5},
+        {"ref": "5259", "position": 2},
+        {"ref": "5297", "position": 2}]}'
+
+# 1件だけ
+curl -X POST "http://localhost:8000/ebay/listing/5222/primary-image" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"position": 2}'
+```
+
+CLI（API を経由せず直接実行。docker compose 環境なら `docker compose exec api` を前置）:
+
+```bash
+python -m scripts.set_primary_images 5222:2 5248:5 5259:2 5297:2 --dry-run
+python -m scripts.set_primary_images 5222:2 5248:5 5259:2 5297:2
+```
+
+### ref の解決順
+
+`ref` は SKU そのもの / SKU の数字部分 / product id のいずれでもよい。
+
+1. `Product.ebay_sku` == ref
+2. `Listing.sku` == ref
+3. 数字なら `EBAY_SKU_PREFIX + ref`（例: `5222` → `mzaiko-5222`）で 1・2 を再検索
+4. それでも無ければ `Product.id` == ref → その `ebay_sku`
+
+### 安全弁
+
+- `dry_run=true` で eBay を一切呼ばずに新しい並びを確認できる
+- 指定位置が画像枚数を超える場合はエラー（その listing だけ失敗、bulk の他件は続行）
+- 既にその画像がトップなら書き込まない（`changed=false` / `reason=already_primary`）
+- PUT は GET した inventory item の**書き込み可能フィールドだけ**を引き継ぐので、
+  タイトル・説明・aspects・在庫は保持される
 
 ## CJ 自動発注（eBayで売れた → CJに反映）
 

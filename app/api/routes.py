@@ -47,6 +47,10 @@ from app.schemas.listing import (
     EbayWithdrawResponse,
     ListingDetail,
     ListItemRequest,
+    PrimaryImageBulkRequest,
+    PrimaryImageBulkResponse,
+    PrimaryImageRequest,
+    PrimaryImageResponse,
     ReviseItemRequest,
 )
 from app.schemas.monitoring import (
@@ -115,6 +119,10 @@ from app.services.csv_service import stream_products_csv
 from app.services.dashboard_service import get_dashboard_summary
 from app.services.ebay import EbayApiError, search_ebay
 from app.services.ebay_auth_service import EbayAuthError, ping_inventory
+from app.services.ebay_image_service import (
+    bulk_set_primary_image,
+    set_primary_image,
+)
 from app.services.ebay_listing_cj_service import (
     create_listing_with_cj_images,
     generate_preview,
@@ -1111,6 +1119,54 @@ async def ebay_listing_preview_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
     return EbayListingPreviewResponse(**result)
+
+
+@private_router.post(
+    "/ebay/listing/{ref}/primary-image",
+    response_model=PrimaryImageResponse,
+    tags=["listing"],
+    summary="トップ画像を現在のn枚目に差し替え（1始まり / dry_run対応）",
+)
+async def ebay_listing_primary_image_endpoint(
+    ref: str,
+    payload: PrimaryImageRequest,
+    session: AsyncSession = Depends(get_session),
+) -> PrimaryImageResponse:
+    try:
+        result = await set_primary_image(
+            session,
+            ref=ref,
+            position=payload.position,
+            dry_run=payload.dry_run,
+            republish=payload.republish,
+        )
+    except ListingError as e:
+        raise HTTPException(status_code=404, detail=f"画像差し替え失敗: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
+    return PrimaryImageResponse(**result)
+
+
+@private_router.post(
+    "/ebay/listings/primary-image/bulk",
+    response_model=PrimaryImageBulkResponse,
+    tags=["listing"],
+    summary="複数listingのトップ画像をまとめて差し替え（1件失敗しても続行）",
+)
+async def ebay_listings_primary_image_bulk_endpoint(
+    payload: PrimaryImageBulkRequest,
+    session: AsyncSession = Depends(get_session),
+) -> PrimaryImageBulkResponse:
+    try:
+        result = await bulk_set_primary_image(
+            session,
+            items=[(i.ref, i.position) for i in payload.items],
+            dry_run=payload.dry_run,
+            republish=payload.republish,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
+    return PrimaryImageBulkResponse(**result)
 
 
 @private_router.post(

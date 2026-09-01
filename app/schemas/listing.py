@@ -184,3 +184,76 @@ class EbayWithdrawResponse(BaseModel):
     sku: str
     reason: str
     error: str | None = None
+
+
+class PrimaryImageRequest(BaseModel):
+    """トップ画像を「現在の n 枚目」に差し替える（n は 1 始まり）。"""
+
+    position: int = Field(
+        ..., ge=1, description="トップにしたい画像の位置（1始まり / 2 なら2枚目）"
+    )
+    dry_run: bool = Field(
+        default=False, description="true なら並び替え結果を返すだけ（eBay を呼ばない）"
+    )
+    republish: bool = Field(
+        default=True,
+        description="published な listing を再publishして即時反映させる",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"position": 2, "dry_run": False}}
+    )
+
+
+class PrimaryImageItem(BaseModel):
+    ref: str = Field(
+        ...,
+        min_length=1,
+        description="SKU / SKUの数字部分 / product id のいずれか（例: 5222）",
+    )
+    position: int = Field(..., ge=1, description="トップにしたい画像の位置（1始まり）")
+
+
+class PrimaryImageBulkRequest(BaseModel):
+    items: list[PrimaryImageItem] = Field(..., min_length=1)
+    dry_run: bool = Field(default=False)
+    republish: bool = Field(default=True)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "items": [
+                    {"ref": "5222", "position": 2},
+                    {"ref": "5248", "position": 5},
+                    {"ref": "5259", "position": 2},
+                    {"ref": "5297", "position": 2},
+                ],
+                "dry_run": True,
+            }
+        }
+    )
+
+
+class PrimaryImageResponse(BaseModel):
+    success: bool
+    sku: str | None = None
+    ref: str
+    position: int
+    changed: bool
+    dry_run: bool
+    reason: str | None = None
+    image_count: int | None = None
+    old_primary: str | None = None
+    new_primary: str | None = None
+    image_urls: list[str] | None = None
+    republished: bool = False
+    listing_id: str | None = None
+    error: str | None = None
+
+
+class PrimaryImageBulkResponse(BaseModel):
+    total: int
+    succeeded: int
+    failed: int
+    dry_run: bool
+    results: list[PrimaryImageResponse]
