@@ -632,7 +632,10 @@ eBay のギャラリー画像（トップ画像）は inventory item の `produc
 ### 反映されないときは
 
 PUT だけでは live listing への反映が遅れることがあるため、**既定で offer を再 publish する**（`republish=true`）。
-published でない listing、または offer_id が見つからない場合は再 publish をスキップし、inventory item の更新のみ行う。
+
+published かどうかは `GET /sell/inventory/v1/offer?sku=` が返す **offer status を正**とする（DB の状態が古い、
+あるいは DB に行が無くても正しく動く）。eBay が `UNPUBLISHED` と返す offer は、下書きを勝手に公開しないよう
+再 publish をスキップする。offer_id が見つからない場合も同様にスキップし、inventory item の更新のみ行う。
 再 publish に失敗しても画像の更新自体は成功として扱う（ログに WARNING を残す）。
 なお eBay/CDN 側のキャッシュにより、検索結果のサムネイル反映には数分〜数十分かかることがある。
 
@@ -673,11 +676,16 @@ python -m scripts.set_primary_images 5222:2 5248:5 5259:2 5297:2
 ### ref の解決順
 
 `ref` は SKU そのもの / SKU の数字部分 / product id のいずれでもよい。
+数字の場合は `EBAY_SKU_PREFIX + ref`（例: `8943` → `mzaiko-8943`）を優先候補にする。
 
-1. `Product.ebay_sku` == ref
-2. `Listing.sku` == ref
-3. 数字なら `EBAY_SKU_PREFIX + ref`（例: `5222` → `mzaiko-5222`）で 1・2 を再検索
-4. それでも無ければ `Product.id` == ref → その `ebay_sku`
+1. ローカル DB: `Product.ebay_sku` == SKU候補
+2. ローカル DB: `Listing.sku` == SKU候補
+3. 数字なら `Product.id` == ref → その `ebay_sku`
+4. **DB に行が無ければ SKU 候補をそのまま eBay に当てる**
+   （このアプリ以外で出した出品でも、SKU が合えば操作できる）
+
+DB 行は再 publish と更新記録に使うだけなので、無くても差し替え自体はできる。
+全候補が eBay にも無ければ、試した SKU をエラーメッセージに含めて失敗する。
 
 ### 安全弁
 

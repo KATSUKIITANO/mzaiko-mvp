@@ -11,6 +11,9 @@ eBay のギャラリー画像は inventory item の `product.imageUrls` の
     引き継いで送る（read-only フィールドを送り返して弾かれるのを防ぐ）
   - published な listing は PUT だけだと反映が遅れることがあるため、
     既定で offer を再 publish して即時反映させる（republish=True）
+    published かどうかは eBay の offer status を正とする（DB の状態より優先）
+  - ローカル DB に行が無い listing（このアプリ以外で出した出品など）でも、
+    SKU が eBay にあれば操作できる
   - dry_run=true なら並び替え結果を返すだけで eBay API を呼ばない
 
 位置指定は 1 始まり（1枚目 = トップ）。
@@ -65,12 +68,8 @@ async def set_primary_image(
     if position < 1:
         raise ListingError(f"position は 1 以上: position={position}")
 
-    sku, product, listing = await _resolve_target(session, ref)
-
     token = await get_access_token()
-    item = await get_inventory_item(token, sku)
-    if item is None:
-        raise ListingError(f"inventory item not found: sku={sku}")
+    sku, product, listing, item = await _resolve_target(session, token, ref)
 
     images = _extract_image_urls(item)
     if not images:
@@ -210,27 +209,62 @@ def _build_update_payload(
     return payload
 
 
-async def _resolve_target(
-    session: AsyncSession, ref: str
-) -> tuple[str, Product | None, Listing | None]:
-    """SKU / SKU の数字部分 / product id のどれでも listing を特定する。"""
-    candidates = [ref]
+def _sku_candidates(ref: str) -> list[str]:
+    """ref から SKU 候補を作る。数字なら prefix 付きを優先。"""
     if ref.isdigit():
-        candidates.append(f"{settings.ebay_sku_prefix}{ref}")
+        prefixed = f"{settings.ebay_sku_prefix}{ref}"
+        return [prefixed, ref] if prefixed != ref else [ref]
+    return [ref]
+
+
+async def _resolve_target(
+    session: AsyncSession, token: str, ref: str
+) -> tuple[str, Product | None, Listing | None, dict[str, Any]]:
+    """SKU / SKU の数字部分 / product id から対象の inventory item を特定する。
+
+    1. ローカル DB（Product.ebay_sku → Listing.sku → Product.id）で SKU を引く
+    2. DB に無ければ SKU 候補をそのまま eBay に当てる
+       （このアプリ以外で出した出品でも、SKU が合えば操作できる）
+
+    DB 行は再 publish と更新記録に使うだけなので、無くても差し替えはできる。
+    """
+    candidates = _sku_candidates(ref)
 
     for sku in candidates:
         product = await _find_product_by_sku(session, sku)
         listing = await _find_listing_by_sku(session, sku)
         if product is not None or listing is not None:
-            return sku, product, listing
+            item = await get_inventory_item(token, sku)
+            if item is None:
+                raise ListingError(
+                    f"inventory item not found on eBay: sku={sku} (ref={ref})"
+                )
+            return sku, product, listing, item
 
     if ref.isdigit():
         product = await session.get(Product, int(ref))
         if product is not None and product.ebay_sku:
-            listing = await _find_listing_by_sku(session, product.ebay_sku)
-            return product.ebay_sku, product, listing
+            sku = product.ebay_sku
+            item = await get_inventory_item(token, sku)
+            if item is None:
+                raise ListingError(
+                    f"inventory item not found on eBay: sku={sku} (ref={ref})"
+                )
+            listing = await _find_listing_by_sku(session, sku)
+            return sku, product, listing, item
 
-    raise ListingError(f"listing not found: ref={ref}")
+    # DB に無い listing → SKU 候補を eBay に直接当てる
+    for sku in candidates:
+        item = await get_inventory_item(token, sku)
+        if item is not None:
+            logger.info(
+                "resolved via eBay only (no local DB row) ref=%s sku=%s", ref, sku
+            )
+            return sku, None, None, item
+
+    raise ListingError(
+        f"listing not found: ref={ref} (tried sku={'/'.join(candidates)})"
+    )
 
 
 async def _find_product_by_sku(session: AsyncSession, sku: str) -> Product | None:
@@ -254,13 +288,26 @@ async def _republish(
 ) -> str | None:
     """published な listing を再 publish して画像差し替えを即時反映させる。
 
+    published 判定は eBay の offer status を正とする（DB が古い / 行が無い場合でも
+    正しく動かすため）。未 publish の offer を勝手に公開しないよう、
+    eBay が UNPUBLISHED と言っている場合はスキップする。
     失敗しても inventory item の更新自体は済んでいるので graceful に握り潰す。
     """
-    if not _is_published(product, listing):
-        logger.info("republish skipped (not published) sku=%s", sku)
+    api_offer_id, api_status = await _fetch_offer_from_api(token, sku)
+
+    if api_status:
+        published = api_status in _PUBLISHED_STATUSES
+    else:
+        published = _is_published(product, listing)
+
+    if not published:
+        logger.info(
+            "republish skipped (not published) sku=%s offer_status=%s",
+            sku, api_status or "unknown",
+        )
         return None
 
-    offer_id = await _find_offer_id(token, sku, product, listing)
+    offer_id = api_offer_id or _db_offer_id(product, listing)
     if not offer_id:
         logger.warning("republish skipped (offer_id not found) sku=%s", sku)
         return None
@@ -289,30 +336,31 @@ def _is_published(product: Product | None, listing: Listing | None) -> bool:
     return False
 
 
-async def _find_offer_id(
-    token: str,
-    sku: str,
-    product: Product | None,
-    listing: Listing | None,
-) -> str | None:
+def _db_offer_id(product: Product | None, listing: Listing | None) -> str | None:
     if product is not None and product.ebay_offer_id:
         return product.ebay_offer_id
     if listing is not None and listing.ebay_offer_id:
         return listing.ebay_offer_id
+    return None
 
+
+async def _fetch_offer_from_api(
+    token: str, sku: str
+) -> tuple[str | None, str | None]:
+    """SKU から offer を引く → (offer_id, status)。失敗時は (None, None)。"""
     try:
         res = await _ebay_request(
             "GET", f"/sell/inventory/v1/offer?sku={sku}", token=token
         )
     except Exception as e:
         logger.warning("offer lookup failed sku=%s err=%s", sku, e)
-        return None
+        return None, None
 
     for offer in res.get("offers") or []:
         offer_id = offer.get("offerId")
         if offer_id:
-            return str(offer_id)
-    return None
+            return str(offer_id), offer.get("status")
+    return None, None
 
 
 async def _mark_revised(
