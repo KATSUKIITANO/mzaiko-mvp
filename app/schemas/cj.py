@@ -50,20 +50,44 @@ class CJOrderPlaceRequest(BaseModel):
     )
 
 
-class CJOrderPlaceResponse(BaseModel):
+class CJParcelResult(BaseModel):
+    """小包1つ分の発注結果（通関対策で分割された場合は複数返る）。"""
+
     success: bool
     skipped: bool = False
     reason: str | None = None
+    split_index: int = 0
+    split_total: int = 1
     dry_run: bool = False
     ebay_order_id: str
     cj_order_id: str | None = None
     cj_order_num: str | None = None
     status: str
     cj_status: str | None = None
+    quantity: int = 1
+    customs_risk_level: str | None = None
     tracking_number: str | None = None
     tracking_pushed: bool = False
     attempts: int = 0
     request_payload: dict | list | None = None
+    error: str | None = None
+
+
+class CJOrderPlaceResponse(BaseModel):
+    """eBay 注文1件分の発注結果（全小包のまとめ）。"""
+
+    success: bool
+    skipped: bool = False
+    reason: str | None = None
+    dry_run: bool = False
+    ebay_order_id: str
+    status: str
+    parcel_count: int = 0
+    split: bool = False
+    customs_risk_level: str | None = None
+    total_quantity: int = 0
+    cj_order_ids: list[str] = Field(default_factory=list)
+    parcels: list[CJParcelResult] = Field(default_factory=list)
     error: str | None = None
 
 
@@ -75,6 +99,9 @@ class CJOrderItem(BaseModel):
     id: int
     order_id: int
     ebay_order_id: str
+    split_index: int
+    split_total: int
+    customs_risk_level: str | None
     sku: str | None
     cj_order_id: str | None
     cj_order_num: str | None
@@ -107,3 +134,17 @@ class CJOrderWorkerMetrics(BaseModel):
     shipped: int = 0
     tracking_pushed: int = 0
     sync_failed: int = 0
+
+
+class CustomsRiskCheckResponse(BaseModel):
+    """出品前・発注前に通関リスクを確認する。"""
+
+    title: str
+    level: str
+    reasons: list[str] = Field(default_factory=list)
+    matched_keyword: str | None = None
+    max_units_per_parcel: int
+    quantity: int
+    parcel_split: list[int] = Field(
+        default_factory=list, description="その数量を発注した場合の小包ごとの個数"
+    )

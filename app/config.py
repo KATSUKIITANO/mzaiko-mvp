@@ -185,6 +185,16 @@ class Settings(BaseSettings):
     cj_order_push_tracking_to_ebay: bool = True
     cj_default_carrier_code: str = "Other"
 
+    # 通関リスク対策（まとめ発送による商用輸入判定を防ぐ）
+    customs_split_enabled: bool = True
+    customs_default_max_units_per_parcel: int = 5
+    customs_medium_max_units_per_parcel: int = 2
+    customs_high_max_units_per_parcel: int = 1
+    customs_high_risk_keywords: str = ""     # 空ならデフォルト定義を使う
+    customs_medium_risk_keywords: str = ""
+    customs_max_split_parcels: int = 10      # 分割しすぎの安全弁
+    customs_alert_on_returned: bool = True   # 返送検知時に Slack 通知
+
     # Rate Limit
     rate_limit_enabled: bool = True
     rate_limit_analyze_per_minute: int = 20

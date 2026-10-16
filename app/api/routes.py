@@ -24,6 +24,7 @@ from app.schemas.cj import (
     CJOrderPlaceRequest,
     CJOrderPlaceResponse,
     CJOrderWorkerMetrics,
+    CustomsRiskCheckResponse,
 )
 from app.schemas.dashboard import DashboardSummary
 from app.schemas.ebay import EbaySearchRequest, EbaySearchResponse
@@ -101,7 +102,7 @@ from app.services.auth_service import verify_api_key
 from app.services.cj_mapping_service import list_mappings, upsert_mapping
 from app.services.cj_order_service import (
     CJOrderError,
-    get_cj_order_for_ebay_order,
+    get_cj_orders_for_ebay_order,
     get_last_metrics as get_cj_order_metrics,
     list_cj_orders,
     place_cj_order_for_ebay_order,
@@ -116,6 +117,7 @@ from app.services.country_risk_service import (
     get_medium_risk_countries,
 )
 from app.services.csv_service import stream_products_csv
+from app.services.customs_risk_service import assess_customs_risk, split_quantity
 from app.services.dashboard_service import get_dashboard_summary
 from app.services.ebay import EbayApiError, search_ebay
 from app.services.ebay_auth_service import EbayAuthError, ping_inventory
@@ -997,19 +999,42 @@ async def cj_orders_list_endpoint(
 
 @private_router.get(
     "/cj/orders/{ebay_order_id}",
-    response_model=CJOrderItem,
+    response_model=list[CJOrderItem],
     tags=["cj"],
-    summary="eBay 注文に紐づく CJ 発注の状態",
+    summary="eBay 注文に紐づく CJ 発注の状態（分割時は小包ごとに複数）",
 )
 async def cj_order_detail_endpoint(
     ebay_order_id: str,
     session: AsyncSession = Depends(get_session),
-) -> CJOrderItem:
+) -> list[CJOrderItem]:
     try:
-        cj_order = await get_cj_order_for_ebay_order(session, ebay_order_id)
+        cj_orders = await get_cj_orders_for_ebay_order(session, ebay_order_id)
     except CJOrderError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return CJOrderItem.model_validate(cj_order)
+    return [CJOrderItem.model_validate(c) for c in cj_orders]
+
+
+@private_router.get(
+    "/cj/customs-risk",
+    response_model=CustomsRiskCheckResponse,
+    tags=["cj"],
+    summary="通関リスクと1小包あたりの上限個数を確認（出品前チェック用）",
+)
+async def cj_customs_risk_endpoint(
+    title: str = Query(..., min_length=1, description="商品タイトル"),
+    sku: str = Query("", description="SKU（任意）"),
+    quantity: int = Query(1, ge=1, le=100, description="発注予定の数量"),
+) -> CustomsRiskCheckResponse:
+    risk = assess_customs_risk(title=title, sku=sku)
+    return CustomsRiskCheckResponse(
+        title=title,
+        level=risk.level,
+        reasons=risk.reasons,
+        matched_keyword=risk.matched_keyword,
+        max_units_per_parcel=risk.max_units_per_parcel,
+        quantity=quantity,
+        parcel_split=split_quantity(quantity, risk.max_units_per_parcel),
+    )
 
 
 @private_router.post(

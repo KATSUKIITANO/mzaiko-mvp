@@ -25,6 +25,7 @@ eBay 出品 + revise + sold sync + fulfillment queue + 配送見積 + 国別リ�
 | `POST /cj/orders/sync` | X-API-Key | CJ発注ワーカー手動実行（発注＋状態同期＋tracking反映） |
 | `GET /cj/orders/worker/metrics` | X-API-Key | CJ発注ワーカーの直近メトリクス |
 | `POST /cj/mappings` | X-API-Key | SKU ↔ CJ商品(pid/vid) の紐付けを登録・更新 |
+| `GET /cj/customs-risk` | X-API-Key | 通関リスクと1小包あたりの上限個数を確認 |
 | `GET /cj/mappings` | X-API-Key | SKU ↔ CJ商品の紐付け一覧 |
 
 ## CJ → eBay 画像統合フロー
@@ -709,6 +710,63 @@ DB 行は再 publish と更新記録に使うだけなので、無くても差�
 - PUT は GET した inventory item の**書き込み可能フィールドだけ**を引き継ぐので、
   タイトル・説明・aspects・在庫は保持される
 
+## 通関リスク対策（まとめ発送による返送を防ぐ）
+
+### 背景（実際に起きた事故）
+
+日焼け止めジェルを**数量5で1小包**にまとめて発送 → 米国税関で「個人使用の範囲を超える＝商用輸入」と判断され、`Item Returned from Customs` で返送。バイヤーに届かず全額返金。
+**同じ商品を1個で送ったときは問題なく届いていた**ため、商品そのものではなく**1小包あたりの個数**が原因。
+
+### 対策1: 通関リスクに応じて小包を分割
+
+`customs_risk_service` が商品タイトルから1小包あたりの上限個数を決め、`cj_order_service` が超える分を別小包として発注する。
+
+| リスク | 上限 | 対象（既定キーワード） |
+|---|---|---|
+| `high` | **1個/小包** | 日焼け止め・化粧品・美容液・サプリ・医薬品・コンタクト |
+| `medium` | **2個/小包** | 液体・粉末・ジェル・オイル・食品・電池・スプレー |
+| `low` | 5個/小包 | それ以外 |
+
+- **同梱時は最も厳しい判定を小包全体に適用**（リスク品が1点でも入っていれば小包ごと止められるため）
+- 分割時は CJ の `orderNumber` が衝突しないよう連番を付ける（`25-15185-11974-1`, `-2`, …）
+- `CUSTOMS_MAX_SPLIT_PARCELS`（既定10）を超える分割は上限個数を自動で引き上げる（送料が嵩むため）
+- 小包ごとに `cj_orders` 行を持つ（`split_index` / `split_total`）。一部だけ失敗しても、再実行で**未発注の小包だけ**発注する
+
+出品前・発注前の確認:
+
+```bash
+curl "http://localhost:8000/cj/customs-risk?title=Invisible%20日焼け止めジェル&quantity=5" \
+  -H "X-API-Key: $KEY"
+# → {"level":"high","max_units_per_parcel":1,"parcel_split":[1,1,1,1,1], ...}
+```
+
+### 対策2: 返送の自動検知
+
+CJ 注文ステータスに `RETURN` / `REJECT` / `DETAIN` / `SEIZED` / `DISCARD` 等が現れたら `cj_orders.status = 'returned'` にして Slack へ通知する。
+
+- **返送時は tracking を eBay に上げない**（届かないものを発送済みにしない）
+- 通知には**同一SKUで配送中の他の発注件数**を含める（商材起因なら巻き添えで返送されるため）
+- `returned` は以後ポーリング対象外（人間の対応待ち）
+
+通知例:
+
+```
+🚨 CJ発注が返送されました
+• eBay order: `25-15185-11974`
+• SKU: `mzaiko-5222`
+• CJ order: `CJ-xxxx`（小包 1/5）
+• CJ status: `Item Returned from Customs`
+• 通関リスク: `high`
+• 同一SKUで配送中の他の発注: 4件
+→ バイヤーへの連絡と返金/再送の判断、CJへのdispute提出が必要です。
+```
+
+### 返送されたときの運用
+
+1. **バイヤーに先手で連絡**し、全額返金（ケースを開かれる前の自主返金なら defect が付かない）
+2. **CJ に dispute を提出**（CJ上で。外部で紛争を起こすとアカウント停止）。ただし通関由来の返送は補償対象外とされているため期待しすぎない
+3. **同一SKUの他の発注を確認** — 複数返送されているなら商材起因なので出品停止
+
 ## CJ 自動発注（eBayで売れた → CJに反映）
 
 eBay で売れた注文を CJ Dropshipping に発注し、CJ が出荷したら追跡番号を eBay に書き戻すまでを閉じたループにする。
@@ -790,9 +848,10 @@ curl "http://localhost:8000/cj/orders/worker/metrics" -H "X-API-Key: $KEY"
 
 | 列 | 内容 |
 |----|------|
-| `order_id` | `orders.id`（UNIQUE：1注文 = 1 CJ発注） |
+| `order_id` + `split_index` | `orders.id` と小包番号（UNIQUE：通関対策で1注文を複数小包に分割） |
+| `split_total` / `customs_risk_level` | 小包の総数と、分割の根拠になった通関リスク |
 | `cj_order_id` / `cj_order_num` | CJ 側の注文ID |
-| `status` | pending / dry_run / created / shipped / delivered / canceled / unmapped / failed |
+| `status` | pending / dry_run / created / shipped / delivered / **returned** / canceled / unmapped / failed |
 | `cj_status` | CJ が返す生のステータス文字列 |
 | `tracking_number` | CJ から取得した追跡番号 |
 | `request_payload` / `response_payload` | createOrderV2 の送受信内容（監査・再現用） |

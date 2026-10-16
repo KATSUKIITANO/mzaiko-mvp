@@ -141,12 +141,12 @@ async def sync_cj_tracking_for_order(
 
     from app.services.cj_order_service import (
         CJOrderError,
-        get_cj_order_for_ebay_order,
+        get_cj_orders_for_ebay_order,
         sync_cj_order,
     )
 
     try:
-        cj_order = await get_cj_order_for_ebay_order(session, order.ebay_order_id)
+        cj_orders = await get_cj_orders_for_ebay_order(session, order.ebay_order_id)
     except CJOrderError as e:
         logger.info(
             "cj tracking sync skipped ebay_order_id=%s reason=%s",
@@ -154,4 +154,10 @@ async def sync_cj_tracking_for_order(
         )
         return {"success": False, "skipped": True, "reason": str(e)}
 
-    return await sync_cj_order(session, cj_order)
+    # 分割発注なら小包ごとに同期する
+    results = [await sync_cj_order(session, cj) for cj in cj_orders]
+    return {
+        "success": all(r.get("success") for r in results),
+        "parcel_count": len(results),
+        "parcels": results,
+    }

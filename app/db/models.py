@@ -10,6 +10,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -115,6 +116,7 @@ class CJOrderStatus(str, enum.Enum):
     CREATED = "created"        # CJ に注文作成済み
     SHIPPED = "shipped"        # CJ 出荷済み（tracking 取得済み）
     DELIVERED = "delivered"    # CJ 側で配達完了
+    RETURNED = "returned"      # 通関などで返送（要対応・自動では進まない）
     CANCELED = "canceled"      # CJ 側でキャンセル
     UNMAPPED = "unmapped"      # SKU → CJ 商品の紐付けが無く発注不可
     FAILED = "failed"          # 発注失敗（リトライ対象）
@@ -525,17 +527,28 @@ class CJProductMapping(Base):
 
 
 class CJOrder(Base):
-    """eBay 注文 1件に対する CJ 発注（1 order = 1 CJ order）。"""
+    """eBay 注文に対する CJ 発注。
+
+    通関対策で1注文を複数小包に分割するため、1 eBay注文に対して複数行持てる
+    （split_index で区別し、(order_id, split_index) で一意）。
+    """
 
     __tablename__ = "cj_orders"
+    __table_args__ = (
+        UniqueConstraint("order_id", "split_index", name="uq_cj_orders_order_split"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("orders.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
         index=True,
+    )
+    split_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    split_total: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    customs_risk_level: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, index=True
     )
     ebay_order_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     sku: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
