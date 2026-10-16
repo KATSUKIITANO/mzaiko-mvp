@@ -673,6 +673,20 @@ python -m scripts.set_primary_images 5222:2 5248:5 5259:2 5297:2 --dry-run
 python -m scripts.set_primary_images 5222:2 5248:5 5259:2 5297:2
 ```
 
+`--from-text` なら「9742 3枚目」形式のリストをそのまま貼り付けて渡せる
+（`9786 2枚目トップ画像変更` のように最終行へ指示文がくっついても読める）:
+
+```bash
+python -m scripts.set_primary_images --from-text - --dry-run <<'EOF'
+9742 3枚目
+9749 3枚目
+9755 2枚目
+EOF
+```
+
+解釈できない行があれば**実行せずにエラーで止まる**（取りこぼし防止）。
+実行前に「対象 N件: 9742:3 9749:3 …」を stderr に出すので、件数と位置を目視確認できる。
+
 ### ref の解決順
 
 `ref` は SKU そのもの / SKU の数字部分 / product id のいずれでもよい。
