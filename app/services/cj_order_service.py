@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select
@@ -42,6 +42,7 @@ from app.db.models import (
     OrderItem,
     OrderStatus,
     Product,
+    TaskStatus,
 )
 from app.scraper.cj import (
     CJError,
@@ -90,6 +91,7 @@ class CJOrderSyncMetrics:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
     placed: int = 0
+    dry_run: int = 0
     place_failed: int = 0
     unmapped: int = 0
     synced: int = 0
@@ -109,6 +111,7 @@ class CJOrderSyncMetrics:
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "duration_seconds": self.duration_seconds,
             "placed": self.placed,
+            "dry_run": self.dry_run,
             "place_failed": self.place_failed,
             "unmapped": self.unmapped,
             "synced": self.synced,
@@ -508,11 +511,24 @@ async def run_cj_order_worker() -> CJOrderSyncMetrics:
 
     try:
         async with AsyncSessionLocal() as session:
-            for cj_order in await _fetch_placeable(session, limit):
-                order = await session.get(Order, cj_order.order_id)
-                if order is None:
+            # ① CJ 発注レコードがまだ無い注文（既存注文の取り込み）
+            backfill = await _fetch_unplaced_orders(session, limit)
+            # ② レコードはあるが未発注・失敗した注文の再試行
+            retries = [
+                o
+                for o in [
+                    await session.get(Order, row.order_id)
+                    for row in await _fetch_placeable(session, limit)
+                ]
+                if o is not None
+            ]
+
+            seen: set[int] = set()
+            for order in backfill + retries:
+                if order.id in seen:
                     continue
-                ebay_order_id = cj_order.ebay_order_id
+                seen.add(order.id)
+                ebay_order_id = order.ebay_order_id
                 try:
                     result = await place_cj_order(session, order)
                 except Exception as e:
@@ -527,6 +543,8 @@ async def run_cj_order_worker() -> CJOrderSyncMetrics:
                 status = result.get("status")
                 if status == CJOrderStatus.CREATED.value:
                     metrics.placed += 1
+                elif status == CJOrderStatus.DRY_RUN.value:
+                    metrics.dry_run += 1
                 elif status == CJOrderStatus.UNMAPPED.value:
                     metrics.unmapped += 1
                 elif status == CJOrderStatus.FAILED.value:
@@ -557,10 +575,10 @@ async def run_cj_order_worker() -> CJOrderSyncMetrics:
 
     metrics.finished_at = datetime.now(timezone.utc)
     logger.info(
-        "cj order worker complete duration=%.1fs placed=%d unmapped=%d "
+        "cj order worker complete duration=%.1fs placed=%d dry_run=%d unmapped=%d "
         "place_failed=%d synced=%d shipped=%d tracking_pushed=%d sync_failed=%d",
         metrics.duration_seconds or 0,
-        metrics.placed, metrics.unmapped, metrics.place_failed,
+        metrics.placed, metrics.dry_run, metrics.unmapped, metrics.place_failed,
         metrics.synced, metrics.shipped, metrics.tracking_pushed,
         metrics.sync_failed,
     )
@@ -585,6 +603,60 @@ async def list_cj_orders(
     return list(result.scalars().all())
 
 
+async def list_unmapped_skus(
+    session: AsyncSession, *, limit: int = 200
+) -> list[dict[str, Any]]:
+    """売れたのに CJ へ発注できない SKU を洗い出す。
+
+    マッピング（cj_product_mappings）が無い SKU は発注できず
+    status='unmapped' で止まる。既存出品は出品時の自動登録を経ていないため、
+    ここで洗い出して /cj/mappings で手当てする必要がある。
+    """
+    # 未発送（＝まだ CJ 発注が完了していない）注文の SKU を集める
+    placed_q = await session.execute(
+        select(CJOrder.order_id).where(CJOrder.cj_order_id.is_not(None))
+    )
+    placed_order_ids = {row for row in placed_q.scalars().all()}
+
+    orders_q = await session.execute(
+        select(Order).order_by(Order.id.desc()).limit(limit)
+    )
+    orders = [o for o in orders_q.scalars().all() if o.id not in placed_order_ids]
+
+    by_sku: dict[str, dict[str, Any]] = {}
+    for order in orders:
+        items_q = await session.execute(
+            select(OrderItem).where(OrderItem.order_id == order.id)
+        )
+        skus = [i.sku for i in items_q.scalars().all() if i.sku] or [order.sku]
+
+        for sku in skus:
+            if not sku:
+                continue
+            if await get_mapping(session, sku) is not None:
+                continue
+            entry = by_sku.setdefault(
+                sku,
+                {
+                    "sku": sku,
+                    "order_count": 0,
+                    "ebay_order_ids": [],
+                    "title": await _lookup_title(session, sku),
+                },
+            )
+            entry["order_count"] += 1
+            if len(entry["ebay_order_ids"]) < 5:
+                entry["ebay_order_ids"].append(order.ebay_order_id)
+
+    out = sorted(by_sku.values(), key=lambda e: -e["order_count"])
+    if out:
+        logger.info(
+            "unmapped skus found count=%d orders=%d",
+            len(out), sum(e["order_count"] for e in out),
+        )
+    return out
+
+
 async def get_cj_orders_for_ebay_order(
     session: AsyncSession, order_ref: str
 ) -> list[CJOrder]:
@@ -603,6 +675,50 @@ async def get_cj_orders_for_ebay_order(
 # ─────────────────────────────────────
 class _UnmappedSkuError(Exception):
     pass
+
+
+async def _fetch_unplaced_orders(session: AsyncSession, limit: int) -> list[Order]:
+    """CJ 発注レコードがまだ無い eBay 注文を拾う。
+
+    sold sync の hook より前に取り込まれた注文（機能追加前の既存注文や、
+    hook が無効だった期間の注文）はレコード自体が無く、
+    cj_orders を見るだけのワーカーでは永久に発注されないため。
+
+    risk / profit gate で failed・canceled になった task の注文は発注しない。
+    """
+    if settings.cj_order_backfill_days <= 0:
+        return []
+
+    since = datetime.now(timezone.utc) - timedelta(
+        days=settings.cj_order_backfill_days
+    )
+    placed = select(CJOrder.order_id)
+    blocked = select(FulfillmentTask.order_id).where(
+        FulfillmentTask.task_status.in_(
+            (TaskStatus.FAILED.value, TaskStatus.CANCELED.value)
+        )
+    )
+
+    result = await session.execute(
+        select(Order)
+        .where(Order.id.not_in(placed))
+        .where(Order.id.not_in(blocked))
+        .where(Order.created_at >= since)
+        .where(
+            Order.order_status.in_(
+                (OrderStatus.DETECTED.value, OrderStatus.PROCESSING.value)
+            )
+        )
+        .order_by(Order.id)
+        .limit(limit)
+    )
+    orders = list(result.scalars().all())
+    if orders:
+        logger.info(
+            "cj backfill: %d orders without a CJ record (lookback=%dd)",
+            len(orders), settings.cj_order_backfill_days,
+        )
+    return orders
 
 
 async def _fetch_placeable(session: AsyncSession, limit: int) -> list[CJOrder]:

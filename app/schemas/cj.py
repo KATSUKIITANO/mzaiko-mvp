@@ -128,6 +128,7 @@ class CJOrderWorkerMetrics(BaseModel):
     finished_at: datetime | None = None
     duration_seconds: float | None = None
     placed: int = 0
+    dry_run: int = 0
     place_failed: int = 0
     unmapped: int = 0
     synced: int = 0

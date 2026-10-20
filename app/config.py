@@ -177,6 +177,8 @@ class Settings(BaseSettings):
     cj_order_pay_type: int = 2             # 2 = 残高払い（CJ 既定）
     cj_order_remark: str = ""
     cj_order_max_attempts: int = 3
+    # まだ CJ 発注レコードが無い既存注文を拾う範囲（0 で無効）
+    cj_order_backfill_days: int = 30
 
     # CJ 注文ステータス同期（CJ 出荷 → eBay へ tracking 反映）
     cj_order_sync_enabled: bool = True

@@ -105,6 +105,7 @@ from app.services.cj_order_service import (
     get_cj_orders_for_ebay_order,
     get_last_metrics as get_cj_order_metrics,
     list_cj_orders,
+    list_unmapped_skus,
     place_cj_order_for_ebay_order,
     run_cj_order_worker,
 )
@@ -1059,6 +1060,23 @@ async def cj_orders_metrics_endpoint() -> CJOrderWorkerMetrics:
     if metrics is None:
         return CJOrderWorkerMetrics()
     return CJOrderWorkerMetrics(**metrics.as_dict())
+
+
+@private_router.get(
+    "/cj/mappings/unmapped",
+    tags=["cj"],
+    summary="売れたのにCJへ発注できないSKU一覧（マッピング未登録）",
+)
+async def cj_unmapped_skus_endpoint(
+    limit: int = Query(200, ge=1, le=1000, description="走査する直近注文数"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    rows = await list_unmapped_skus(session, limit=limit)
+    return {
+        "unmapped_sku_count": len(rows),
+        "affected_order_count": sum(r["order_count"] for r in rows),
+        "items": rows,
+    }
 
 
 @private_router.post(

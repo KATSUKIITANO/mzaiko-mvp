@@ -26,6 +26,7 @@ eBay 出品 + revise + sold sync + fulfillment queue + 配送見積 + 国別リ�
 | `GET /cj/orders/worker/metrics` | X-API-Key | CJ発注ワーカーの直近メトリクス |
 | `POST /cj/mappings` | X-API-Key | SKU ↔ CJ商品(pid/vid) の紐付けを登録・更新 |
 | `GET /cj/customs-risk` | X-API-Key | 通関リスクと1小包あたりの上限個数を確認 |
+| `GET /cj/mappings/unmapped` | X-API-Key | 売れたのにCJへ発注できないSKU一覧 |
 | `GET /cj/mappings` | X-API-Key | SKU ↔ CJ商品の紐付け一覧 |
 
 ## CJ → eBay 画像統合フロー
@@ -822,6 +823,37 @@ curl -X POST "http://localhost:8000/cj/mappings" \
   -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"sku": "mzaiko-1", "cj_product_id": "123456"}'
 ```
+
+### 既存注文の取り込み（backfill）
+
+sold sync の hook より前に取り込まれた注文（機能追加前の既存注文、hook が無効だった期間の注文）は
+`cj_orders` にレコード自体が無いため、cj_orders を見るだけでは永久に発注されない。
+ワーカーは **CJ 発注レコードが無い eBay 注文**も `CJ_ORDER_BACKFILL_DAYS`（既定30日）の範囲で拾う。
+
+- `order_status` が detected / processing のものだけが対象
+- risk / profit gate で failed・canceled になった fulfillment task の注文は**発注しない**
+- `CJ_ORDER_BACKFILL_DAYS=0` で無効化
+
+### CLI（売れた商品を CJ に反映する）
+
+```bash
+# 1. 発注できない SKU を洗い出す（マッピング未登録の商品）
+python -m scripts.sync_cj_orders --unmapped
+
+# 2. payload だけ作って確認（CJ API は呼ばない）
+python -m scripts.sync_cj_orders --dry-run
+
+# 3. 本発注 + 状態同期 + tracking の eBay 反映
+python -m scripts.sync_cj_orders
+
+# 特定の注文だけ / 発注状況サマリ
+python -m scripts.sync_cj_orders --order 25-15185-11974 --dry-run
+python -m scripts.sync_cj_orders --status
+```
+
+**`--unmapped` が最初の関門**。既存出品は出品時の自動登録を経ていないため SKU ↔ CJ 商品の紐付けが無く、
+そのままでは `status='unmapped'` で止まる。一覧に出た SKU を `POST /cj/mappings` で手当てしてから発注する。
+API では `GET /cj/mappings/unmapped` で同じ情報が取れる。
 
 ### 手動発注・状態確認
 
