@@ -48,10 +48,13 @@ from app.schemas.listing import (
     EbayWithdrawResponse,
     ListingDetail,
     ListItemRequest,
+    CJImageRefreshRequest,
+    ImageUpdateResponse,
     PrimaryImageBulkRequest,
     PrimaryImageBulkResponse,
     PrimaryImageRequest,
     PrimaryImageResponse,
+    PrimaryImageUrlRequest,
     ReviseItemRequest,
 )
 from app.schemas.monitoring import (
@@ -124,7 +127,9 @@ from app.services.ebay import EbayApiError, search_ebay
 from app.services.ebay_auth_service import EbayAuthError, ping_inventory
 from app.services.ebay_image_service import (
     bulk_set_primary_image,
+    refresh_images_from_cj,
     set_primary_image,
+    set_primary_image_url,
 )
 from app.services.ebay_listing_cj_service import (
     create_listing_with_cj_images,
@@ -1188,6 +1193,59 @@ async def ebay_listing_primary_image_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
     return PrimaryImageResponse(**result)
+
+
+@private_router.post(
+    "/ebay/listing/{ref}/primary-image/url",
+    response_model=ImageUpdateResponse,
+    tags=["listing"],
+    summary="トップ画像を新しいURLに差し替え（パッケージ変更など）",
+)
+async def ebay_listing_primary_image_url_endpoint(
+    ref: str,
+    payload: PrimaryImageUrlRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ImageUpdateResponse:
+    try:
+        result = await set_primary_image_url(
+            session,
+            ref=ref,
+            image_url=payload.image_url,
+            replace_existing=payload.replace_existing,
+            dry_run=payload.dry_run,
+            republish=payload.republish,
+        )
+    except ListingError as e:
+        raise HTTPException(status_code=400, detail=f"画像差し替え失敗: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
+    return ImageUpdateResponse(**result)
+
+
+@private_router.post(
+    "/ebay/listing/{ref}/images/refresh-from-cj",
+    response_model=ImageUpdateResponse,
+    tags=["listing"],
+    summary="CJの現在の商品画像でlistingの画像を入れ替え",
+)
+async def ebay_listing_refresh_images_endpoint(
+    ref: str,
+    payload: CJImageRefreshRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ImageUpdateResponse:
+    try:
+        result = await refresh_images_from_cj(
+            session,
+            ref=ref,
+            cj_product_id=payload.cj_product_id,
+            dry_run=payload.dry_run,
+            republish=payload.republish,
+        )
+    except ListingError as e:
+        raise HTTPException(status_code=400, detail=f"画像更新失敗: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"予期しないエラー: {e}")
+    return ImageUpdateResponse(**result)
 
 
 @private_router.post(

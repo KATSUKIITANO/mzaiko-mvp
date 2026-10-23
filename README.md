@@ -18,6 +18,8 @@ eBay 出品 + revise + sold sync + fulfillment queue + 配送見積 + 国別リ�
 | `POST /ebay/listing/{sku}/withdraw` | X-API-Key | 手動でeBay listingを停止（offer withdraw） |
 | `POST /ebay/listing/{ref}/primary-image` | X-API-Key | トップ画像を現在のn枚目に差し替え（1始まり / dry_run対応） |
 | `POST /ebay/listings/primary-image/bulk` | X-API-Key | 複数listingのトップ画像をまとめて差し替え |
+| `POST /ebay/listing/{ref}/primary-image/url` | X-API-Key | トップ画像を新しいURLに差し替え（パッケージ変更など） |
+| `POST /ebay/listing/{ref}/images/refresh-from-cj` | X-API-Key | CJの現在の商品画像でlistingの画像を入れ替え |
 | `POST /ebay/orders/sync` | X-API-Key | eBay Fulfillment APIから注文を incremental 同期 |
 | `POST /cj/orders/{ebay_order_id}/place` | X-API-Key | eBayで売れた注文をCJに発注（冪等 / dry_run対応） |
 | `GET /cj/orders` | X-API-Key | CJ発注の一覧（status で絞り込み） |
@@ -688,6 +690,33 @@ EOF
 
 解釈できない行があれば**実行せずにエラーで止まる**（取りこぼし防止）。
 実行前に「対象 N件: 9742:3 9749:3 …」を stderr に出すので、件数と位置を目視確認できる。
+
+### 新しい画像に差し替える（パッケージ変更など）
+
+並べ替えでは対応できない「新しい写真を1枚目にする」ケース。
+
+```bash
+# 1枚目だけ新しいURLに差し替え（旧1枚目は削除）
+curl -X POST "http://localhost:8000/ebay/listing/7697/primary-image/url" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"image_url": "https://.../new-package.jpg", "dry_run": true}'
+
+# 旧1枚目を残して先頭に差し込む（2枚目へ送る）
+  -d '{"image_url": "https://.../new.jpg", "replace_existing": false}'
+
+# CJ側の画像が差し替わったなら、まとめて取り直す方が早い
+curl -X POST "http://localhost:8000/ebay/listing/7697/images/refresh-from-cj" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"dry_run": true}'          # cj_product_id 省略時は mapping から引く
+```
+
+**画像URLは https の公開URLであること。** eBay Inventory API の `imageUrls` は
+URL しか受け付けないため、ローカルの画像ファイルは直接渡せない。
+CJ の商品画像URL（`GET /cj/product/{pid}/images` で取得可能）を使うのが基本。
+
+- 同じURLが既に登録済みなら、重複登録せず並べ替えだけ行う
+- `EBAY_MAX_IMAGE_COUNT`（既定12枚）を超える分はトリムされる
+- http / 非URL は eBay に弾かれる前にエラーにする
 
 ### ref の解決順
 

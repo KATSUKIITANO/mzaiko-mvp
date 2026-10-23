@@ -29,11 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.models import Listing, Product
+from app.services.cj_mapping_service import get_mapping
 from app.services.ebay_auth_service import get_access_token
 from app.services.ebay_inventory_service import (
     get_inventory_item,
     upsert_inventory_item,
 )
+from app.services.ebay_listing_cj_service import _fetch_cj_image_urls
 from app.services.ebay_listing_service import ListingError, _ebay_request
 from app.services.ebay_offer_service import publish_offer
 
@@ -127,6 +129,178 @@ async def set_primary_image(
 
     await _mark_revised(session, product, listing, position)
     return result
+
+
+async def set_primary_image_url(
+    session: AsyncSession,
+    *,
+    ref: str,
+    image_url: str,
+    replace_existing: bool = True,
+    dry_run: bool = False,
+    republish: bool = True,
+) -> dict[str, Any]:
+    """トップ画像を**新しい URL** に差し替える（パッケージ変更などで使う）。
+
+    replace_existing=True  … 今の1枚目を捨てて新画像を1枚目にする（既定）
+    replace_existing=False … 新画像を先頭に差し込み、今の1枚目は2枚目へ送る
+
+    eBay Inventory API の imageUrls は**公開アクセス可能な URL** しか受け付けない。
+    ローカル画像は直接渡せないため、CJ の商品画像 URL などを指定する。
+    """
+    url = (image_url or "").strip()
+    if not url.startswith("https://"):
+        raise ListingError(
+            f"画像URLは https:// である必要がある: url={url[:120]}"
+        )
+
+    token = await get_access_token()
+    sku, product, listing, item = await _resolve_target(session, token, ref)
+
+    images = _extract_image_urls(item)
+    old_top = images[0] if images else None
+
+    if url in images:
+        # 既にある画像なら並べ替えで済む（重複登録を避ける）
+        reordered = _move_to_front(images, images.index(url) + 1)
+    elif replace_existing and images:
+        reordered = [url] + images[1:]
+    else:
+        reordered = [url] + images
+
+    reordered = _dedupe(reordered)[: settings.ebay_max_image_count]
+    changed = reordered[0] != old_top
+
+    result: dict[str, Any] = {
+        "success": True,
+        "sku": sku,
+        "ref": ref,
+        "position": 1,
+        "changed": changed,
+        "dry_run": dry_run,
+        "image_count": len(reordered),
+        "old_primary": old_top,
+        "new_primary": reordered[0],
+        "image_urls": reordered,
+        "replaced": replace_existing and old_top is not None and old_top not in reordered,
+        "republished": False,
+        "listing_id": None,
+    }
+
+    if not changed:
+        result["reason"] = "already_primary"
+        logger.info("primary image already set sku=%s url=%s", sku, url)
+        return result
+
+    if dry_run:
+        logger.info(
+            "primary image url dry_run sku=%s %s → %s", sku, old_top, url
+        )
+        return result
+
+    await upsert_inventory_item(token, sku, _build_update_payload(item, reordered))
+    logger.info(
+        "primary image replaced sku=%s images=%d new_top=%s dropped=%s",
+        sku, len(reordered), url, result["replaced"],
+    )
+
+    if republish:
+        listing_id = await _republish(session, token, sku, product, listing)
+        result["republished"] = listing_id is not None
+        result["listing_id"] = listing_id
+
+    await _mark_revised(session, product, listing, 1)
+    return result
+
+
+async def refresh_images_from_cj(
+    session: AsyncSession,
+    *,
+    ref: str,
+    cj_product_id: str | None = None,
+    dry_run: bool = False,
+    republish: bool = True,
+) -> dict[str, Any]:
+    """CJ の現在の商品画像で listing の画像を入れ替える。
+
+    パッケージ変更で CJ 側の画像が差し替わったときに使う。
+    cj_product_id 省略時は cj_product_mappings から SKU で引く。
+    """
+    token = await get_access_token()
+    sku, product, listing, item = await _resolve_target(session, token, ref)
+
+    pid = cj_product_id
+    if not pid:
+        mapping = await get_mapping(session, sku)
+        if mapping is None:
+            raise ListingError(
+                f"CJ商品が紐付いていない: sku={sku}"
+                "（cj_product_id を指定するか /cj/mappings で登録する）"
+            )
+        pid = mapping.cj_product_id
+
+    raw_urls = await _fetch_cj_image_urls(pid)
+    new_images = _dedupe(
+        [u for u in raw_urls if isinstance(u, str) and u.strip().startswith("https://")]
+    )[: settings.ebay_max_image_count]
+
+    if not new_images:
+        raise ListingError(f"CJから画像を取得できなかった: cj_pid={pid}")
+
+    current = _extract_image_urls(item)
+    changed = new_images != current
+
+    result: dict[str, Any] = {
+        "success": True,
+        "sku": sku,
+        "ref": ref,
+        "cj_product_id": pid,
+        "changed": changed,
+        "dry_run": dry_run,
+        "image_count": len(new_images),
+        "old_primary": current[0] if current else None,
+        "new_primary": new_images[0],
+        "old_image_urls": current,
+        "image_urls": new_images,
+        "republished": False,
+        "listing_id": None,
+    }
+
+    if not changed:
+        result["reason"] = "no_change"
+        logger.info("cj images unchanged sku=%s cj_pid=%s", sku, pid)
+        return result
+
+    if dry_run:
+        logger.info(
+            "cj image refresh dry_run sku=%s cj_pid=%s %d→%d images",
+            sku, pid, len(current), len(new_images),
+        )
+        return result
+
+    await upsert_inventory_item(token, sku, _build_update_payload(item, new_images))
+    logger.info(
+        "cj images refreshed sku=%s cj_pid=%s %d→%d images",
+        sku, pid, len(current), len(new_images),
+    )
+
+    if republish:
+        listing_id = await _republish(session, token, sku, product, listing)
+        result["republished"] = listing_id is not None
+        result["listing_id"] = listing_id
+
+    await _mark_revised(session, product, listing, 1)
+    return result
+
+
+def _dedupe(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 async def bulk_set_primary_image(

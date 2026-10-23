@@ -257,3 +257,55 @@ class PrimaryImageBulkResponse(BaseModel):
     failed: int
     dry_run: bool
     results: list[PrimaryImageResponse]
+
+
+class PrimaryImageUrlRequest(BaseModel):
+    """トップ画像を新しいURLに差し替える（パッケージ変更など）。"""
+
+    image_url: str = Field(
+        ..., min_length=1, description="新しいトップ画像のURL（https必須・公開アクセス可能なこと）"
+    )
+    replace_existing: bool = Field(
+        default=True,
+        description="true=今の1枚目を捨てる / false=先頭に差し込み既存は2枚目へ",
+    )
+    dry_run: bool = Field(default=False)
+    republish: bool = Field(default=True)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "image_url": "https://cbu01.alicdn.com/img/ibank/xxxx.jpg",
+                "replace_existing": True,
+            }
+        }
+    )
+
+
+class CJImageRefreshRequest(BaseModel):
+    """CJの現在の商品画像でlistingの画像を入れ替える。"""
+
+    cj_product_id: str | None = Field(
+        default=None, description="省略時は cj_product_mappings から SKU で引く"
+    )
+    dry_run: bool = Field(default=False)
+    republish: bool = Field(default=True)
+
+
+class ImageUpdateResponse(BaseModel):
+    success: bool
+    sku: str | None = None
+    ref: str
+    cj_product_id: str | None = None
+    changed: bool
+    dry_run: bool
+    reason: str | None = None
+    image_count: int | None = None
+    old_primary: str | None = None
+    new_primary: str | None = None
+    old_image_urls: list[str] | None = None
+    image_urls: list[str] | None = None
+    replaced: bool = False
+    republished: bool = False
+    listing_id: str | None = None
+    position: int | None = None
